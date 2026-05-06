@@ -1,197 +1,309 @@
-// Live Audio Transcription Example — Foundry Local JS SDK
-//
-// Demonstrates real-time microphone-to-text using the JS SDK.
-// Requires: npm install foundry-local-sdk naudiodon2
-//
-// Usage: node app.js
-
+import express from 'express';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { FoundryLocalManager } from 'foundry-local-sdk';
 
-console.log('╔══════════════════════════════════════════════════════════╗');
-console.log('║   Foundry Local — Live Audio Transcription (JS SDK)      ║');
-console.log('╚══════════════════════════════════════════════════════════╝');
-console.log();
-
-// Initialize the Foundry Local SDK
-console.log('Initializing Foundry Local SDK...');
-const manager = FoundryLocalManager.create({
-    appName: 'foundry_local_samples',
-    logLevel: 'info'
-});
-console.log('✓ SDK initialized');
-
-// Get and load the nemotron model
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const distDir = path.join(__dirname, 'dist');
+const port = Number(process.env.PORT ?? 3001);
 const modelAlias = 'nemotron-speech-streaming-en-0.6b';
-let model = await manager.catalog.getModel(modelAlias);
-if (!model) {
-    console.error(`ERROR: Model "${modelAlias}" not found in catalog.`);
-    process.exit(1);
-}
 
-console.log(`Found model: ${model.id}`);
-console.log('Downloading model (if needed)...');
-await model.download((progress) => {
-    process.stdout.write(`\rDownloading... ${progress.toFixed(2)}%`);
-});
-console.log('\n✓ Model downloaded');
+const app = express();
 
-console.log('Loading model...');
-await model.load();
-console.log('✓ Model loaded');
+app.use(express.json());
 
-// Create live transcription session (same pattern as C# sample).
-const audioClient = model.createAudioClient();
-const session = audioClient.createLiveTranscriptionSession();
+const state = {
+    revision: 0,
+    status: 'idle',
+    events: [],
+    error: null,
+    resetCounter: 0
+};
 
-session.settings.sampleRate = 16000;  // Default is 16000; shown here for clarity
-session.settings.channels = 1;
-session.settings.bitsPerSample = 16;
-session.settings.language = 'en';
+const clients = new Set();
 
-console.log('Starting streaming session...');
-await session.start();
-console.log('✓ Session started');
-
-// Read transcription results in background
-const readPromise = (async () => {
-    try {
-        for await (const result of session.getStream()) {
-            const text = result.content?.[0]?.text;
-            if (!text) continue;
-
-            // `is_final` is a transcript-state marker only. It should not stop the app.
-            if (result.is_final) {
-                process.stdout.write(`\n  [FINAL] ${text}\n`);
-            } else {
-                process.stdout.write(text);
-            }
-        }
-    } catch (err) {
-        if (err.name !== 'AbortError') {
-            console.error('Stream error:', err.message);
-        }
-    }
-})();
-
-// --- Microphone capture ---
-// This example uses naudiodon2 for cross-platform audio capture.
-// Install with: npm install naudiodon2
-//
-// If you prefer a different audio library, just push PCM bytes
-// (16-bit signed LE, mono, 16kHz) via session.append().
-
+let manager;
+let model;
+let session;
 let audioInput;
-try {
-    const { default: portAudio } = await import('naudiodon2');
+let readPromise;
+let startPromise;
+let transcriptId = 0;
 
-    audioInput = portAudio.AudioIO({
-        inOptions: {
-            channelCount: session.settings.channels,
-            sampleFormat: session.settings.bitsPerSample === 16
-                ? portAudio.SampleFormat16Bit
-                : portAudio.SampleFormat32Bit,
-            sampleRate: session.settings.sampleRate,
-            // Larger chunk size lowers callback frequency and reduces overflow risk.
-            framesPerBuffer: 3200,
-            // Allow deeper native queue during occasional event-loop stalls.
-            maxQueue: 64
+const broadcast = (event, payload) => {
+    const message = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+    for (const client of clients) {
+        client.write(message);
+    }
+};
+
+const emitState = () => {
+    state.revision += 1;
+    broadcast('state', state);
+};
+
+const updateState = (patch) => {
+    Object.assign(state, patch);
+    emitState();
+};
+
+const pushTranscript = (entry) => {
+    state.events = [...state.events, entry];
+    emitState();
+};
+
+const ensureModelLoaded = async () => {
+    if (!manager) {
+        manager = FoundryLocalManager.create({
+            appName: 'foundray_demo_transcript_web',
+            logLevel: 'info'
+        });
+    }
+
+    if (!model) {
+        const locatedModel = await manager.catalog.getModel(modelAlias);
+        if (!locatedModel) {
+            throw new Error(`Model "${modelAlias}" not found in catalog.`);
         }
-    });
 
-    const appendQueue = [];
-    let pumping = false;
-    let warnedQueueDrop = false;
+        updateState({ status: 'downloading', error: null });
+        await locatedModel.download(() => {});
+        updateState({ status: 'loading' });
+        await locatedModel.load();
+        model = locatedModel;
+    }
 
-    const pumpAudio = async () => {
-        if (pumping) return;
-        pumping = true;
+    return model;
+};
+
+const stopAudioInput = () => {
+    if (!audioInput) {
+        return;
+    }
+
+    try {
+        audioInput.quit();
+    } catch {
+        // Ignore teardown errors during shutdown.
+    } finally {
+        audioInput = null;
+    }
+};
+
+const stopTranscription = async () => {
+    stopAudioInput();
+
+    if (session) {
+        const currentSession = session;
+        session = null;
+
         try {
-            while (appendQueue.length > 0) {
-                const pcm = appendQueue.shift();
-                await session.append(pcm);
-            }
-        } catch (err) {
-            console.error('append error:', err.message);
+            await currentSession.stop();
+        } catch {
+            // Ignore stop errors when session is already ending.
+        }
+    }
+
+    if (readPromise) {
+        try {
+            await readPromise;
+        } catch {
+            // Stream reader errors are already reported through state.
         } finally {
-            pumping = false;
-            // Handle race where new data arrived after loop exit.
-            if (appendQueue.length > 0) {
-                void pumpAudio();
-            }
+            readPromise = null;
         }
-    };
+    }
 
-    audioInput.on('data', (buffer) => {
-        // Single copy: slice the underlying ArrayBuffer to get an independent Uint8Array.
-        const copy = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).slice();
+    updateState({ status: 'idle' });
+};
 
-        // Keep a bounded queue to avoid unbounded memory growth.
-        if (appendQueue.length >= 100) {
-            appendQueue.shift();
-            if (!warnedQueueDrop) {
-                warnedQueueDrop = true;
-                console.warn('Audio append queue overflow; dropping oldest chunk to keep stream alive.');
+const startTranscription = async () => {
+    if (state.status === 'running') {
+        return state;
+    }
+
+    if (startPromise) {
+        await startPromise;
+        return state;
+    }
+
+    startPromise = (async () => {
+        updateState({ status: 'initializing', error: null });
+
+        const activeModel = await ensureModelLoaded();
+        const audioClient = activeModel.createAudioClient();
+        const liveSession = audioClient.createLiveTranscriptionSession();
+
+        liveSession.settings.sampleRate = 16000;
+        liveSession.settings.channels = 1;
+        liveSession.settings.bitsPerSample = 16;
+        liveSession.settings.language = 'en';
+
+        await liveSession.start();
+        session = liveSession;
+
+        readPromise = (async () => {
+            try {
+                for await (const result of liveSession.getStream()) {
+                    const text = result.content?.[0]?.text?.trim();
+                    if (!text) {
+                        continue;
+                    }
+
+                    pushTranscript({
+                        id: ++transcriptId,
+                        text,
+                        isFinal: Boolean(result.is_final),
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    updateState({
+                        status: 'error',
+                        error: error.message
+                    });
+                    broadcast('error', { message: error.message });
+                }
             }
-        }
+        })();
 
-        appendQueue.push(copy);
-        void pumpAudio();
+        const { default: portAudio } = await import('naudiodon2');
+        const appendQueue = [];
+        let pumping = false;
+
+        const pumpAudio = async () => {
+            if (pumping || !session) {
+                return;
+            }
+
+            pumping = true;
+
+            try {
+                while (appendQueue.length > 0 && session) {
+                    const pcm = appendQueue.shift();
+                    await session.append(pcm);
+                }
+            } finally {
+                pumping = false;
+                if (appendQueue.length > 0) {
+                    void pumpAudio();
+                }
+            }
+        };
+
+        audioInput = portAudio.AudioIO({
+            inOptions: {
+                channelCount: liveSession.settings.channels,
+                sampleFormat: portAudio.SampleFormat16Bit,
+                sampleRate: liveSession.settings.sampleRate,
+                framesPerBuffer: 3200,
+                maxQueue: 64
+            }
+        });
+
+        audioInput.on('data', (buffer) => {
+            const copy = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).slice();
+
+            if (appendQueue.length >= 100) {
+                appendQueue.shift();
+            }
+
+            appendQueue.push(copy);
+            void pumpAudio();
+        });
+
+        audioInput.start();
+        updateState({ status: 'running', error: null });
+    })();
+
+    try {
+        await startPromise;
+        return state;
+    } catch (error) {
+        await stopTranscription();
+        updateState({ status: 'error', error: error.message });
+        throw error;
+    } finally {
+        startPromise = null;
+    }
+};
+
+app.get('/api/transcript/state', (_req, res) => {
+    res.json(state);
+});
+
+app.post('/api/transcript/start', async (_req, res) => {
+    try {
+        await startTranscription();
+        res.json(state);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/transcript/stop', async (_req, res) => {
+    await stopTranscription();
+    res.json(state);
+});
+
+app.post('/api/transcript/reset', (_req, res) => {
+    state.events = [];
+    state.error = null;
+    transcriptId = 0;
+    state.resetCounter += 1;
+    emitState();
+    res.json(state);
+});
+
+app.get('/api/transcript/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    clients.add(res);
+    res.write(`event: state\ndata: ${JSON.stringify(state)}\n\n`);
+
+    req.on('close', () => {
+        clients.delete(res);
     });
+});
 
-    console.log();
-    console.log('════════════════════════════════════════════════════════════');
-    console.log('  LIVE TRANSCRIPTION ACTIVE');
-    console.log('  Speak into your microphone.');
-    console.log('  Press Ctrl+C to stop.');
-    console.log('════════════════════════════════════════════════════════════');
-    console.log();
+if (existsSync(distDir)) {
+    app.use(express.static(distDir));
 
-    audioInput.start();
-} catch (err) {
-    console.warn('⚠ Could not initialize microphone input:', err.message);
-    console.warn('⚠ Could not initialize microphone (naudiodon2 may not be installed).');
-    console.warn('  Install with: npm install naudiodon2');
-    console.warn('  Falling back to synthetic audio test...');
-    console.warn();
-
-    // Fallback: push 2 seconds of synthetic PCM (440Hz sine wave)
-    const sampleRate = session.settings.sampleRate;
-    const duration = 2;
-    const totalSamples = sampleRate * duration;
-    const pcmBytes = new Uint8Array(totalSamples * 2);
-    for (let i = 0; i < totalSamples; i++) {
-        const t = i / sampleRate;
-        const sample = Math.round(32767 * 0.5 * Math.sin(2 * Math.PI * 440 * t));
-        pcmBytes[i * 2] = sample & 0xFF;
-        pcmBytes[i * 2 + 1] = (sample >> 8) & 0xFF;
-    }
-
-    // Push in 100ms chunks
-    const chunkSize = (sampleRate / 10) * 2;
-    for (let offset = 0; offset < pcmBytes.length; offset += chunkSize) {
-        const len = Math.min(chunkSize, pcmBytes.length - offset);
-        await session.append(pcmBytes.slice(offset, offset + len));
-    }
-
-    console.log('✓ Synthetic audio pushed');
-    console.log('Waiting briefly for final transcription results...');
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    await session.stop();
-    await readPromise;
-    await model.unload();
-    console.log('✓ Done');
-    process.exit(0);
+    app.get(/^(?!\/api).*/, (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+    });
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n\nStopping...');
-    if (audioInput) {
-        audioInput.quit();
+const server = app.listen(port, () => {
+    console.log(`Transcript server listening on http://localhost:${port}`);
+});
+
+const shutdown = async () => {
+    await stopTranscription();
+
+    if (model) {
+        try {
+            await model.unload();
+        } catch {
+            // Ignore unload errors during shutdown.
+        }
     }
-    await session.stop();
-    await readPromise;
-    await model.unload();
-    console.log('✓ Done');
-    process.exit(0);
+
+    server.close(() => {
+        process.exit(0);
+    });
+};
+
+process.on('SIGINT', () => {
+    void shutdown();
+});
+
+process.on('SIGTERM', () => {
+    void shutdown();
 });

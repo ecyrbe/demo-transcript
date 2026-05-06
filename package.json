@@ -2,13 +2,25 @@
   "name": "live-audio-transcription-example",
   "version": "1.0.0",
   "type": "module",
-  "description": "Live audio transcription example using the Foundry Local JS SDK",
+  "description": "Live audio transcription web app using the Foundry Local JS SDK",
   "main": "app.js",
   "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "node --watch app.js",
+    "dev:client": "vite",
+    "build": "vite build",
     "start": "node app.js"
   },
   "dependencies": {
+    "express": "^5.1.0",
     "foundry-local-sdk": "latest",
-    "naudiodon2": "^2.5.0"
+    "naudiodon2": "^2.5.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.1.2",
+    "vite": "^7.0.0"
   }
 }
